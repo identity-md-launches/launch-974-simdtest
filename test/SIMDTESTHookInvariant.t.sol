@@ -15,6 +15,32 @@ import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientSta
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Vm, TestPairedToken, LiquidityActor} from "./helpers/TestSupport.sol";
 
+/// @dev A stranger who parks IMD inside the PoolManager as ERC-6909 claims owned by the hook.
+///      Anyone can do this; it must only ever enlarge what the treasury receives.
+contract ClaimGifter is IUnlockCallback {
+    IPoolManager public immutable manager;
+    address public immutable paired;
+
+    constructor(IPoolManager manager_, address paired_) {
+        manager = manager_;
+        paired = paired_;
+    }
+
+    function gift(address to, uint256 amount) external {
+        manager.unlock(abi.encode(to, amount));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "manager only");
+        (address to, uint256 amount) = abi.decode(data, (address, uint256));
+        manager.mint(to, Currency.wrap(paired).toId(), amount);
+        manager.sync(Currency.wrap(paired));
+        require(TestPairedToken(paired).transfer(address(manager), amount));
+        manager.settle();
+        return "";
+    }
+}
+
 /// @dev Stateful handler. It is the launch factory of its hook, the unlock callback for its own
 ///      swaps and liquidity changes, and the bookkeeper of every fee the hook reports. Third
 ///      parties are LiquidityActor contracts so the hook sees them, not this handler, as sender.
@@ -43,15 +69,22 @@ contract SIMDTESTHookHandler is IUnlockCallback {
     SIMDTESTHook public hook;
     PoolKey public key;
     LiquidityActor[] public actors;
+    ClaimGifter public gifter;
 
     // Ghost ledger.
     string public violation;
     uint256 public openingBlock;
+    /// @dev Sum of every treasury fee the hook reported. Paid IMD plus deferred claims must equal it.
     uint256 public ghostTreasury;
+    /// @dev IMD strangers parked as hook-owned claims; it may only ever reach the treasury.
+    uint256 public ghostGifted;
     uint256 public ghostDonated;
     uint256 public ghostSwaps;
     uint256 public ghostSwapReverts;
-    uint256 public ghostStarvedBuys;
+    uint256 public ghostDeferredSwaps;
+    uint256 public ghostBacklogFlushes;
+    uint256 public ghostPrepaidBuys;
+    uint256 public ghostPayouts;
     uint256 public ghostWindowSwaps;
     uint256 public ghostDonatingSwaps;
     uint256 public ghostDrainedSwaps;
@@ -59,6 +92,7 @@ contract SIMDTESTHookHandler is IUnlockCallback {
     uint256 public ghostThirdPartyRejections;
     uint256 public ghostTransfers;
     uint256 public ghostFactoryLiquidity;
+    uint256 public ghostFactoryWithdrawals;
     bytes public lastSwapRevert;
     mapping(uint256 => uint256) public actorLiquidity;
 
@@ -72,6 +106,18 @@ contract SIMDTESTHookHandler is IUnlockCallback {
         uint256 donated;
         uint256 donatedToken;
     }
+
+    struct Snapshot {
+        uint256 treasury;
+        uint256 pending;
+        uint256 managerPaired;
+        uint256 growth;
+        uint256 rate;
+    }
+
+    /// @dev Pool.PriceLimitAlreadyExceeded(uint160,uint160): the core refuses a swap whose limit
+    ///      the price already sits on, which happens after a swap drained the range to the limit.
+    bytes4 private constant PRICE_LIMIT_EXCEEDED = bytes4(keccak256("PriceLimitAlreadyExceeded(uint160,uint160)"));
 
     constructor(IPoolManager manager_, SIMDTEST token_, TestPairedToken pair_) {
         manager = manager_;
@@ -100,6 +146,8 @@ contract SIMDTESTHookHandler is IUnlockCallback {
             token.transfer(address(actor), 1e26);
             actors.push(actor);
         }
+        gifter = new ClaimGifter(manager, PAIR);
+        pair.mint(address(gifter), 1e27);
         // The 10% dead-address allocation of the launch plan.
         token.transfer(DEAD, 1e26);
     }
@@ -112,17 +160,17 @@ contract SIMDTESTHookHandler is IUnlockCallback {
 
     /// @notice Random swap in one of the four modes by the handler or a third party.
     function swap(uint256 actorSeed, uint8 mode, uint96 rawAmount) external {
-        // Mostly moderate trades; about one in sixty-four is large enough to push the price out of
-        // the seeded range. Hash-derived so the fuzzer's edge-value bias does not make it common.
-        bool large = uint256(keccak256(abi.encode(actorSeed, rawAmount, mode))) % 64 == 0;
-        uint256 amount = large ? uint256(rawAmount) % 2e23 + 1e22 : uint256(rawAmount) % 5e21 + 1;
+        // Mostly moderate trades; about one in thirty-two is large enough to drain every position
+        // in range and run the price to its limit, so later swaps meet an empty range, partial
+        // fills and the core's price-limit refusal. Hash-derived so the fuzzer's edge-value bias
+        // does not make it common.
+        bool large = uint256(keccak256(abi.encode(actorSeed, rawAmount, mode))) % 32 == 0;
+        uint256 amount = large ? uint256(rawAmount) % 2e24 + 1e23 : uint256(rawAmount) % 5e21 + 1;
         bool buy = mode & 1 == 1;
         bool exactInput = mode & 2 == 2;
         IPoolManager.SwapParams memory params = _params(buy, exactInput, amount);
         uint256 who = actorSeed % (actors.length + 1);
-        uint256 treasuryBefore = pair.balanceOf(TREASURY);
-        uint256 growthBefore = _pairGrowth();
-        uint256 rate = hook.antiSnipeBps() + 50;
+        Snapshot memory before = _snapshot();
         vm.recordLogs();
         bool ok;
         if (who == 0) {
@@ -141,29 +189,105 @@ contract SIMDTESTHookHandler is IUnlockCallback {
                 lastSwapRevert = reason;
             }
         }
-        Seen memory seen = _observe(vm.getRecordedLogs());
+        _settleSwapLedger(ok, false, before, _observe(vm.getRecordedLogs()));
+    }
+
+    /// @notice A router that syncs and transfers its IMD before the swap and settles afterwards.
+    ///         The hook cannot take IMD while the router's payment is synced, so this swap's
+    ///         treasury fee must be deferred as a claim rather than failing the buy.
+    function prepaidBuy(uint96 rawAmount) external {
+        uint256 amount = uint256(rawAmount) % 5e21 + 1;
+        IPoolManager.SwapParams memory params = _params(true, true, amount);
+        Snapshot memory before = _snapshot();
+        vm.recordLogs();
+        bool ok;
+        try manager.unlock(abi.encode(uint8(2), abi.encode(params))) {
+            ok = true;
+        } catch (bytes memory reason) {
+            lastSwapRevert = reason;
+        }
+        if (ok) ++ghostPrepaidBuys;
+        _settleSwapLedger(ok, true, before, _observe(vm.getRecordedLogs()));
+    }
+
+    /// @notice Anyone may push deferred treasury claims out to the treasury. Outside a swap the
+    ///         manager always holds the IMD behind every claim, so the whole backlog must clear.
+    function payTreasury(uint256 callerSeed) external {
+        uint256 pendingBefore = hook.pendingTreasury();
+        uint256 treasuryBefore = pair.balanceOf(TREASURY);
+        address caller = address(uint160(uint256(keccak256(abi.encode("payer", callerSeed % 4)))));
+        vm.prank(caller);
+        uint256 paid = hook.payTreasury();
+        _check(paid == pendingBefore, "payTreasury did not clear the backlog");
+        _check(hook.pendingTreasury() == 0, "claims remain after payout");
+        _check(pair.balanceOf(TREASURY) - treasuryBefore == paid, "payout differs from treasury credit");
+        _check(pair.balanceOf(caller) == 0, "payer received IMD");
+        if (paid != 0) ++ghostPayouts;
+    }
+
+    /// @notice A stranger parks IMD as hook-owned claims. It must never disturb swaps and must
+    ///         only ever end up with the treasury.
+    function giftClaims(uint96 rawAmount) external {
+        uint256 amount = uint256(rawAmount) % 1e21 + 1;
+        uint256 pendingBefore = hook.pendingTreasury();
+        gifter.gift(address(hook), amount);
+        _check(hook.pendingTreasury() == pendingBefore + amount, "gifted claims not counted as pending");
+        ghostGifted += amount;
+    }
+
+    /// @dev Books one swap attempt against the ghost ledger. `before` was taken immediately
+    ///      before the attempt; the manager's physical IMD at that moment is what the hook sees
+    ///      inside afterSwap, because every router here settles after the swap returns.
+    function _settleSwapLedger(bool ok, bool prepaid, Snapshot memory before, Seen memory seen) private {
+        Snapshot memory current = _snapshot();
+        uint256 rate = before.rate;
         if (!ok) {
             ++ghostSwapReverts;
-            // Reported separately: a buy that fails because the manager holds less IMD than the
-            // treasury fee the hook takes in afterSwap (see .imd-findings.json). Not a ledger
-            // violation, but the pool cannot be bought until someone deposits IMD.
-            if (buy && pair.balanceOf(address(manager)) < amount * 50 / BPS) ++ghostStarvedBuys;
-            _check(pair.balanceOf(TREASURY) == treasuryBefore, "reverted swap paid treasury");
-            _check(_pairGrowth() == growthBefore, "reverted swap donated");
+            // The only legitimate failures: a specified-IMD swap that the pool could not fill in
+            // full, or the core refusing a swap whose price limit is already reached. Both leave
+            // every balance untouched. Anything else is a defect.
+            _check(
+                _revertContains(SIMDTESTHook.PartialFillUnsupported.selector) || _revertContains(PRICE_LIMIT_EXCEEDED),
+                "unexpected swap revert"
+            );
+            _check(current.treasury == before.treasury, "reverted swap paid treasury");
+            _check(current.pending == before.pending, "reverted swap changed claims");
+            _check(current.growth == before.growth, "reverted swap donated");
             return;
         }
         ++ghostSwaps;
         _check(seen.sawSwap && seen.sawFees, "swap without fee accounting");
         _check(seen.donatedToken == 0, "launch token donated");
         _check(seen.donated == seen.anti, "donation differs from reported anti-snipe amount");
-        _check(pair.balanceOf(TREASURY) - treasuryBefore == seen.treasury, "treasury transfer mismatch");
+        // Treasury fee ledger: IMD that left for the treasury plus the change in deferred claims
+        // equals the fee this swap reported, and the pay-or-defer choice follows exactly what the
+        // manager could hand out at that moment.
+        uint256 paid = current.treasury - before.treasury;
+        uint256 available = prepaid ? 0 : before.managerPaired;
+        uint256 expectedPaid;
+        uint256 expectedPending = before.pending;
+        if (seen.treasury != 0) {
+            if (before.pending != 0 && available >= seen.treasury + before.pending) {
+                expectedPaid = seen.treasury + before.pending;
+                expectedPending = 0;
+                ++ghostBacklogFlushes;
+            } else if (available >= seen.treasury) {
+                expectedPaid = seen.treasury;
+            } else {
+                expectedPending += seen.treasury;
+                ++ghostDeferredSwaps;
+            }
+        }
+        _check(paid == expectedPaid, "treasury payment differs from what the manager could pay");
+        _check(current.pending == expectedPending, "deferred claims off ledger");
+        _check(prepaid ? paid == 0 : true, "took IMD out from under a synced payment");
         uint256 combined = seen.gross * rate / BPS;
         _check(seen.anti + seen.treasury == combined, "fee split does not equal combined fee");
         uint256 baseTreasury = seen.gross * 50 / BPS;
         if (seen.anti != 0) {
             _check(seen.treasury == baseTreasury, "treasury fee not 0.5% while donating");
             ++ghostDonatingSwaps;
-            _check(_pairGrowth() > growthBefore, "donation did not raise paired fee growth");
+            _check(current.growth > before.growth, "donation did not raise paired fee growth");
         } else if (combined != baseTreasury) {
             // Anti-snipe amount routed to the treasury: only legal when the range is empty.
             _check(manager.getLiquidity(key.toId()) == 0, "anti-snipe went to treasury with liquidity in range");
@@ -229,12 +353,20 @@ contract SIMDTESTHookHandler is IUnlockCallback {
                 _check(false, "factory addition rejected");
             }
         } else {
-            // The factory keeps at least a quarter of its seed so sequences stay tradeable; full
-            // withdrawal of the launch position is a liveness scenario covered by the findings.
-            uint256 floor = SEED_LIQUIDITY / 4;
-            if (ghostFactoryLiquidity <= floor) return;
-            uint256 amount = uint256(rawAmount) % (ghostFactoryLiquidity - floor);
-            if (amount == 0) return;
+            // Usually the factory keeps at least a quarter of its seed so sequences stay
+            // tradeable. Now and then it withdraws the whole launch position: the pool must keep
+            // working (buys defer their treasury fee instead of failing) until liquidity returns.
+            if (ghostFactoryLiquidity == 0) return;
+            uint256 amount;
+            if (uint256(keccak256(abi.encode("withdraw", rawAmount))) % 16 == 0) {
+                amount = ghostFactoryLiquidity;
+                ++ghostFactoryWithdrawals;
+            } else {
+                uint256 floor = SEED_LIQUIDITY / 4;
+                if (ghostFactoryLiquidity <= floor) return;
+                amount = uint256(rawAmount) % (ghostFactoryLiquidity - floor);
+                if (amount == 0) return;
+            }
             try manager.unlock(abi.encode(uint8(1), abi.encode(-int256(amount)))) {
                 ghostFactoryLiquidity -= amount;
             } catch {
@@ -245,6 +377,8 @@ contract SIMDTESTHookHandler is IUnlockCallback {
 
     /// @notice Collecting accrued fees is a zero-delta modification; it must always be allowed.
     function collectFees() external {
+        // v4 itself refuses a zero-delta update of an empty position (CannotUpdateEmptyPosition).
+        if (ghostFactoryLiquidity == 0) return;
         try manager.unlock(abi.encode(uint8(1), abi.encode(int256(0)))) {}
         catch {
             _check(false, "fee collection rejected");
@@ -277,13 +411,14 @@ contract SIMDTESTHookHandler is IUnlockCallback {
     // ---------------------------------------------------------------- views for invariants
 
     function participants() external view returns (address[] memory list) {
-        list = new address[](actors.length + 4);
+        list = new address[](actors.length + 5);
         list[0] = address(this);
         list[1] = address(manager);
         list[2] = TREASURY;
         list[3] = DEAD;
+        list[4] = address(gifter);
         for (uint256 i; i < actors.length; ++i) {
-            list[4 + i] = address(actors[i]);
+            list[5 + i] = address(actors[i]);
         }
     }
 
@@ -299,6 +434,21 @@ contract SIMDTESTHookHandler is IUnlockCallback {
         BalanceDelta delta;
         if (action == 0) {
             delta = manager.swap(key, abi.decode(payload, (IPoolManager.SwapParams)), "");
+        } else if (action == 2) {
+            // Pre-paying router: IMD is synced and transferred before the swap, settled after it.
+            IPoolManager.SwapParams memory params = abi.decode(payload, (IPoolManager.SwapParams));
+            uint256 input = uint256(-params.amountSpecified);
+            manager.sync(Currency.wrap(PAIR));
+            require(pair.transfer(address(manager), input));
+            delta = manager.swap(key, params, "");
+            require(manager.settle() == input, "prepaid amount");
+            int128 tokenDelta = _pairIs0() ? delta.amount1() : delta.amount0();
+            if (tokenDelta > 0) {
+                manager.take(Currency.wrap(address(token)), address(this), uint256(uint128(tokenDelta)));
+            }
+            require(manager.currencyDelta(address(hook), Currency.wrap(PAIR)) == 0, "hook paired debt");
+            require(manager.currencyDelta(address(hook), Currency.wrap(address(token))) == 0, "hook token debt");
+            return abi.encode(delta);
         } else {
             (delta,) = manager.modifyLiquidity(
                 key,
@@ -381,6 +531,29 @@ contract SIMDTESTHookHandler is IUnlockCallback {
         }
     }
 
+    function _snapshot() private view returns (Snapshot memory snap) {
+        snap.treasury = pair.balanceOf(TREASURY);
+        snap.pending = hook.pendingTreasury();
+        snap.managerPaired = pair.balanceOf(address(manager));
+        snap.growth = _pairGrowth();
+        snap.rate = hook.antiSnipeBps() + 50;
+    }
+
+    /// @dev True when the last swap revert carries `selector` anywhere in its data. The manager
+    ///      wraps hook reverts in WrappedError(target, selector, reason, details), so the hook's
+    ///      own selector sits inside `reason` rather than at the front.
+    function _revertContains(bytes4 selector) private view returns (bool) {
+        bytes memory data = lastSwapRevert;
+        if (data.length < 4) return false;
+        for (uint256 i; i + 4 <= data.length; ++i) {
+            if (
+                data[i] == selector[0] && data[i + 1] == selector[1] && data[i + 2] == selector[2]
+                    && data[i + 3] == selector[3]
+            ) return true;
+        }
+        return false;
+    }
+
     function _check(bool condition, string memory reason) private {
         if (!condition && bytes(violation).length == 0) violation = reason;
     }
@@ -395,7 +568,8 @@ contract SIMDTESTHookInvariantTest {
     address private constant PAIR = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     address private constant TREASURY = 0x3dD5F73dD1A4E62630fAd3909673F130aD429985;
     uint160 private constant FLAGS = 0x28cc;
-    uint256 private constant PAIR_SUPPLY = 3e27;
+    /// @dev Handler, two actors and the claim gifter each receive 1e27 IMD.
+    uint256 private constant PAIR_SUPPLY = 4e27;
     uint256 private constant TOKEN_SUPPLY = 1_000_000_000e18;
 
     IPoolManager private manager;
@@ -433,7 +607,7 @@ contract SIMDTESTHookInvariantTest {
 
     /// @dev Only the handler's actions are fuzzed; its launch and unlock plumbing are not user entry points.
     function targetSelectors() public view returns (FuzzSelector[] memory selectors) {
-        bytes4[] memory actions = new bytes4[](7);
+        bytes4[] memory actions = new bytes4[](10);
         actions[0] = SIMDTESTHookHandler.swap.selector;
         actions[1] = SIMDTESTHookHandler.roll.selector;
         actions[2] = SIMDTESTHookHandler.thirdPartyAddLiquidity.selector;
@@ -441,6 +615,9 @@ contract SIMDTESTHookInvariantTest {
         actions[4] = SIMDTESTHookHandler.factoryModifyLiquidity.selector;
         actions[5] = SIMDTESTHookHandler.collectFees.selector;
         actions[6] = SIMDTESTHookHandler.transfer.selector;
+        actions[7] = SIMDTESTHookHandler.prepaidBuy.selector;
+        actions[8] = SIMDTESTHookHandler.payTreasury.selector;
+        actions[9] = SIMDTESTHookHandler.giftClaims.selector;
         selectors = new FuzzSelector[](1);
         selectors[0] = FuzzSelector({addr: address(handler), selectors: actions});
     }
@@ -510,8 +687,23 @@ contract SIMDTESTHookInvariantTest {
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 40
     function invariant_TreasuryBalanceEqualsReportedFees() public view {
-        require(pair.balanceOf(TREASURY) == handler.ghostTreasury(), "treasury balance differs from fee ledger");
+        // Every reported treasury fee, and every claim strangers gifted to the hook, is either
+        // already with the treasury or still a hook-owned claim inside the manager. Nothing else
+        // can hold it and nothing is lost between the two.
+        require(
+            pair.balanceOf(TREASURY) + hook.pendingTreasury() == handler.ghostTreasury() + handler.ghostGifted(),
+            "treasury balance plus deferred claims differ from fee ledger"
+        );
         require(token.balanceOf(TREASURY) == 0, "treasury received launch token");
+    }
+
+    /// forge-config: default.invariant.runs = 128
+    /// forge-config: default.invariant.depth = 40
+    function invariant_DeferredClaimsAreAlwaysBacked() public view {
+        // Between transactions nothing is synced, so the manager physically holds the IMD behind
+        // every deferred claim and a permissionless payTreasury can always clear the backlog.
+        require(hook.pendingTreasury() <= pair.balanceOf(address(manager)), "claims exceed the manager's IMD");
+        require(manager.balanceOf(address(hook), Currency.wrap(address(token)).toId()) == 0, "hook holds token claims");
     }
 
     /// forge-config: default.invariant.runs = 128
