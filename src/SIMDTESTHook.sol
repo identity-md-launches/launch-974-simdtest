@@ -4,14 +4,22 @@ pragma solidity 0.8.26;
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 
 /// @notice Immutable, single-pool SIMD Launchpad hook. All swap fees are denominated in IMD.
 /// @dev Initialization only binds the opening block. Fee mechanics run exclusively in swap callbacks.
+///      While the anti-snipe fee is nonzero, only the launch factory (or the launch transaction
+///      itself) may add liquidity, so donated anti-snipe fees reach the seeded launch liquidity
+///      rather than just-in-time positions.
 contract SIMDTESTHook {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
     address public constant PAIRED_CURRENCY = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     address public constant TREASURY = 0x3dD5F73dD1A4E62630fAd3909673F130aD429985;
     uint24 public constant BASE_FEE = 12500;
@@ -21,10 +29,14 @@ contract SIMDTESTHook {
     uint256 public constant ANTI_SNIPE_BLOCKS = 10;
     uint256 private constant BPS = 10000;
     uint256 private constant MAX_AMOUNT = uint256(uint128(type(int128).max));
+    /// @dev Transient flag set by beforeInitialize for the rest of the launch transaction.
+    ///      Value: keccak256("SIMDTESTHook.launchTransaction").
+    uint256 private constant LAUNCH_TX_SLOT = 0x76d8999e61265dc958409216863db5b960fa42776f080f4e7f3400202b5e7da3;
 
     IPoolManager public immutable poolManager;
     address public immutable launchToken;
-    /// @notice The deploying launch factory may initialize once; it has no administrative powers.
+    /// @notice The launch factory may initialize once and seed liquidity during the anti-snipe
+    ///         window; it has no administrative powers.
     address public immutable launchFactory;
     bool public initialized;
     uint256 public openingBlock;
@@ -37,17 +49,21 @@ contract SIMDTESTHook {
     error PoolNotInitialized();
     error InvalidAmount();
     error PartialFillUnsupported();
+    error LiquidityLockedDuringAntiSnipe();
 
     event PoolOpened(uint256 indexed blockNumber);
     event SwapFees(uint256 grossPairedAmount, uint256 antiSnipeAmount, uint256 treasuryAmount);
 
-    constructor(IPoolManager manager, address token) {
-        if (address(manager).code.length == 0 || token.code.length == 0 || token == PAIRED_CURRENCY) {
+    constructor(IPoolManager manager, address token, address factory) {
+        if (
+            address(manager).code.length == 0 || token.code.length == 0 || token == PAIRED_CURRENCY
+                || factory == address(0)
+        ) {
             revert InvalidAddress();
         }
         poolManager = manager;
         launchToken = token;
-        launchFactory = msg.sender;
+        launchFactory = factory;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
     }
 
@@ -58,6 +74,7 @@ contract SIMDTESTHook {
 
     function getHookPermissions() public pure returns (Hooks.Permissions memory p) {
         p.beforeInitialize = true;
+        p.beforeAddLiquidity = true;
         p.beforeSwap = true;
         p.afterSwap = true;
         p.beforeSwapReturnDelta = true;
@@ -70,8 +87,27 @@ contract SIMDTESTHook {
         if (sender != launchFactory) revert NotLaunchFactory();
         initialized = true;
         openingBlock = block.number;
+        assembly ("memory-safe") {
+            tstore(LAUNCH_TX_SLOT, 1)
+        }
         emit PoolOpened(block.number);
         return IHooks.beforeInitialize.selector;
+    }
+
+    /// @notice While the anti-snipe fee is nonzero only the launch factory, or any caller within
+    ///         the transaction that initialized the pool, may add liquidity. Removals are never
+    ///         restricted. After the window, liquidity provision is open to everyone.
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external view onlyPoolManager returns (bytes4) {
+        _checkKey(key);
+        if (antiSnipeBps() != 0 && sender != launchFactory && !_inLaunchTransaction()) {
+            revert LiquidityLockedDuringAntiSnipe();
+        }
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     /// @notice Opening block pays 30%; subsequent blocks decline by 3 percentage points, reaching 0 at B+10.
@@ -116,6 +152,12 @@ contract SIMDTESTHook {
         uint256 treasuryFee = gross * TREASURY_BPS / BPS;
         // Combined fee rounds down once. Any split rounding remainder (<=1 wei) goes to LPs.
         uint256 donation = fee - treasuryFee;
+        if (donation != 0 && poolManager.getLiquidity(key.toId()) == 0) {
+            // The swap emptied the active range: no position can receive a donation, so the
+            // anti-snipe amount follows the treasury fee instead of failing the swap.
+            treasuryFee += donation;
+            donation = 0;
+        }
         if (donation != 0) {
             poolManager.donate(key, pairIs0 ? donation : 0, pairIs0 ? 0 : donation, "");
         }
@@ -149,6 +191,12 @@ contract SIMDTESTHook {
         } else {
             gross = pairIsInput ? _grossUp(actual, rate) : actual;
             fee = gross * rate / BPS;
+        }
+    }
+
+    function _inLaunchTransaction() private view returns (bool launching) {
+        assembly ("memory-safe") {
+            launching := tload(LAUNCH_TX_SLOT)
         }
     }
 

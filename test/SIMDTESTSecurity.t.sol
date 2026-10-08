@@ -19,19 +19,20 @@ contract SIMDTESTSecurityTest {
     SIMDTESTHook private hook;
     IPoolManager private manager;
 
-    uint160 private constant FLAGS = (1 << 13) | (1 << 7) | (1 << 6) | (1 << 3) | (1 << 2);
+    uint160 private constant FLAGS = (1 << 13) | (1 << 11) | (1 << 7) | (1 << 6) | (1 << 3) | (1 << 2);
 
     function setUp() public {
         token = new SIMDTEST();
         manager = IPoolManager(address(new SecurityManagerFixture()));
-        bytes memory initCode = abi.encodePacked(type(SIMDTESTHook).creationCode, abi.encode(manager, address(token)));
+        bytes memory initCode =
+            abi.encodePacked(type(SIMDTESTHook).creationCode, abi.encode(manager, address(token), address(this)));
         bytes32 initCodeHash = keccak256(initCode);
         for (uint256 nonce; nonce < 1_000_000; ++nonce) {
             bytes32 salt = bytes32(nonce);
             address predicted =
                 address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash)))));
             if (uint160(predicted) & ((1 << 14) - 1) == FLAGS) {
-                hook = new SIMDTESTHook{salt: salt}(manager, address(token));
+                hook = new SIMDTESTHook{salt: salt}(manager, address(token), address(this));
                 require(address(hook) == predicted, "CREATE2 prediction");
                 return;
             }
@@ -42,17 +43,36 @@ contract SIMDTESTSecurityTest {
     function testHookDeploysAtExactlyDeclaredPermissionBits() public view {
         require(uint160(address(hook)) & ((1 << 14) - 1) == FLAGS, "permission address bits");
         Hooks.Permissions memory p = hook.getHookPermissions();
-        require(p.beforeInitialize && p.beforeSwap && p.afterSwap, "active callbacks");
+        require(p.beforeInitialize && p.beforeAddLiquidity && p.beforeSwap && p.afterSwap, "active callbacks");
         require(p.beforeSwapReturnDelta && p.afterSwapReturnDelta, "return deltas");
         require(
-            !p.afterInitialize && !p.beforeAddLiquidity && !p.afterAddLiquidity && !p.beforeRemoveLiquidity
-                && !p.afterRemoveLiquidity && !p.beforeDonate && !p.afterDonate && !p.afterAddLiquidityReturnDelta
+            !p.afterInitialize && !p.afterAddLiquidity && !p.beforeRemoveLiquidity && !p.afterRemoveLiquidity
+                && !p.beforeDonate && !p.afterDonate && !p.afterAddLiquidityReturnDelta
                 && !p.afterRemoveLiquidityReturnDelta,
             "other callbacks disabled"
         );
         require(address(hook.poolManager()) == address(manager), "immutable manager");
         require(hook.launchToken() == address(token), "immutable token");
-        require(hook.launchFactory() == address(this), "initialization authority is deploying factory");
+        require(hook.launchFactory() == address(this), "initialization authority is the configured factory");
+    }
+
+    function testConstructorRejectsMissingInputs() public {
+        bytes memory noFactory =
+            abi.encodePacked(type(SIMDTESTHook).creationCode, abi.encode(manager, address(token), address(0)));
+        bytes memory noToken =
+            abi.encodePacked(type(SIMDTESTHook).creationCode, abi.encode(manager, address(0xBEEF), address(this)));
+        bytes memory pairAsToken = abi.encodePacked(
+            type(SIMDTESTHook).creationCode, abi.encode(manager, hook.PAIRED_CURRENCY(), address(this))
+        );
+        require(_create(noFactory) == address(0), "zero factory accepted");
+        require(_create(noToken) == address(0), "codeless token accepted");
+        require(_create(pairAsToken) == address(0), "paired currency accepted as launch token");
+    }
+
+    function _create(bytes memory code) private returns (address deployed) {
+        assembly ("memory-safe") {
+            deployed := create(0, add(code, 32), mload(code))
+        }
     }
 
     function testDeploymentAndRuntimeSizesWithinEthereumLimits() public view {
@@ -102,7 +122,10 @@ contract SIMDTESTSecurityTest {
         IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
             zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: uint160(1 << 96)
         });
+        IPoolManager.ModifyLiquidityParams memory liquidity =
+            IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 1, salt: 0});
         _requiresManager(abi.encodeCall(hook.beforeInitialize, (address(this), key, uint160(1 << 96))));
+        _requiresManager(abi.encodeCall(hook.beforeAddLiquidity, (address(this), key, liquidity, bytes(""))));
         _requiresManager(abi.encodeCall(hook.beforeSwap, (address(this), key, params, bytes(""))));
         _requiresManager(abi.encodeCall(hook.afterSwap, (address(this), key, params, BalanceDelta.wrap(0), bytes(""))));
         require(!hook.initialized(), "unauthorized initialization had no effect");

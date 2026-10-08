@@ -26,39 +26,61 @@ local mock at the task's fixed IMD address, not a live mainnet fork.
 | Parameter | Value |
 | --- | --- |
 | Chain | Ethereum mainnet, chain ID 1 |
-| Hook constructor | `SIMDTESTHook(IPoolManager manager, address token)` |
+| Hook constructor | `SIMDTESTHook(IPoolManager manager, address token, address factory)` |
 | `manager` / `$poolManager` | `0x000000000004444c5dc75cB358380D2e3dE08A90` |
 | `token` / `$token` | The actual SIMDTEST deployed by the launch factory immediately before the hook |
+| `factory` / `$factory` | The launch factory: the direct caller of `PoolManager.initialize` and the only address allowed to add liquidity during the anti-snipe window from outside the launch transaction |
 | Paired currency | IMD, `0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7`, 18 decimals |
 | Treasury | `0x3dd5f73dd1a4e62630fad3909673f130ad429985` |
 | Static pool LP fee | 12500 millionths = 1.25% |
 | Tick spacing | 60 |
-| Hook address permission bits | `address(hook) & 0x3fff == 0x20cc` |
+| Hook address permission bits | `address(hook) & 0x3fff == 0x28cc` |
 | Manifest initial price | `79228162514264337593543950336` (Q64.96); provenance only |
 
-The manager is a constructor argument, not hardcoded in hook code. IMD and
-treasury are constants from the task. The launch token and deploying factory
-are immutable. No address is filled with a stand-in or configured after launch.
-The constructor checks manager/token code and validates the address permission
-bits. The same bytecode can be tested against a local manager; mainnet targeting
-is the launch factory's deployment responsibility.
+The manager and the factory are constructor arguments, not hardcoded in hook
+code. IMD and treasury are constants from the task. The launch token and launch
+factory are immutable. No address is filled with a stand-in or configured after
+launch. The constructor checks manager/token code, rejects a zero factory, and
+validates the address permission bits. The same bytecode can be tested against a
+local manager; mainnet targeting is the launch factory's deployment responsibility.
 
-The factory must deploy the hook with CREATE2 and mine a salt for the actual
-factory address, hook creation code and ABI-encoded constructor arguments.
-Enabled permissions are `beforeInitialize`, `beforeSwap`, `afterSwap`,
-`beforeSwapReturnDelta`, and `afterSwapReturnDelta`. Initialize with sorted
-currencies, the specified fee and spacing, and this hook. Other keys are rejected.
-The factory that directly creates the hook must also be the direct caller of
-`PoolManager.initialize`; an intermediate deployer or initialization router will
-not work. The factory address is only a one-time initialization gate and grants
-no control over fees, swaps or liquidity after initialization.
+The hook must be deployed with CREATE2 at an address whose low 14 bits are
+`0x28cc`; mine the salt for the actual deployer address, hook creation code and
+ABI-encoded constructor arguments. The deployer may be the factory itself or a
+CREATE2 helper: `launchFactory` is the `factory` constructor argument, not
+`msg.sender`. Enabled permissions are `beforeInitialize`, `beforeAddLiquidity`,
+`beforeSwap`, `afterSwap`, `beforeSwapReturnDelta`, and `afterSwapReturnDelta`.
+Initialize with sorted currencies, the specified fee and spacing, and this hook.
+Other keys are rejected. The `factory` address must be the direct caller of
+`PoolManager.initialize`; an initialization router in between will not work.
+The factory address is only an initialization gate and a liquidity-seeding
+allowance during the anti-snipe window; it grants no control over fees or swaps.
 
 Deploy the token, deploy and initialize the hook pool, and seed liquidity
 atomically. `beforeInitialize` rejects non-manager calls and initialization by
-anyone except the deploying factory; it records the opening block once. Having
+anyone except the configured factory; it records the opening block once. Having
 this permission also prevents initialization at an empty predicted hook address.
 The factory determines the actual opening price from launch economics and must
 supply the paired IMD funding. The manifest price is not an onchain price check.
+
+## Liquidity during the anti-snipe window
+
+`beforeAddLiquidity` rejects every liquidity addition while the anti-snipe fee is
+nonzero (blocks `B` to `B+9`) unless the direct caller of
+`PoolManager.modifyLiquidity` is the factory, or the addition happens inside the
+transaction that initialized the pool (a transient flag set by `beforeInitialize`,
+so a factory that seeds through a periphery contract such as a position manager
+in its launch transaction still works). Removals are never restricted. From
+`B+10` on, liquidity provision is open to everyone and the hook ignores it.
+
+Without this gate a searcher could add a large just-in-time position in the same
+unlock as any early buy and collect almost the whole anti-snipe donation, because
+`donate` pays liquidity in range after the swap. With the gate, the only liquidity
+that can exist during the window is what the factory seeded, so every donation
+accrues to the launch position. Consequence for the factory: seed the pool from
+the factory address or within the initialize transaction. A seed sent through a
+periphery contract in a later transaction during the window is rejected and must
+wait until `B+10`.
 
 ## Supply and launchpad responsibilities
 
@@ -133,9 +155,21 @@ positive returned fee delta settles within the same unlock. No fee remains in
 the hook, is converted to ETH, is deferred as a claim, or is sent to a burn
 address. SIMDTEST transfers and approvals never call the hook.
 
-Donation distributes IMD fee growth to liquidity in range **after the swap**.
-It increases claimable LP fees, not liquidity units `L`; LPs decide whether to
-compound. There is no automatic purchase, burn, or reinvestment.
+Donation distributes IMD fee growth to liquidity in range **after the swap**, as
+the brief's `PoolManager.donate` requirement implies. It increases the fees the
+in-range positions can collect, not the pool's liquidity units `L`, so later
+buyers do not see deeper liquidity. The donated IMD stays inside the PoolManager
+until the position owner calls `modifyLiquidity` on that position (a zero-delta
+call suffices). The factory, or whichever locker holds the 80% launch position,
+must therefore be able to collect fees; otherwise donations are stranded. There
+is no automatic purchase, burn, or reinvestment.
+
+If a swap drains the active range so that no liquidity is in range after it,
+nothing can receive a donation (`donate` would revert). In that case the
+anti-snipe amount is added to the treasury transfer of that swap instead of
+failing the swap; the `SwapFees` event then reports a zero anti-snipe amount and
+the enlarged treasury amount. This only happens on a swap that empties the seed
+range during the first ten blocks.
 
 ## Routing limits and review assumptions
 
@@ -146,20 +180,28 @@ reverts the entire transaction with `PartialFillUnsupported`. For token-specifie
 swaps fees use actual executed IMD and partial fills are supported. Routers must
 check realized amounts and use appropriate user slippage limits/deadlines.
 
-If a nonzero donation is due but the swap ends with no active liquidity,
-Uniswap's donation operation reverts atomically. No fee is charged and no swap
-persists. Launch liquidity ranges must support intended early trading. Once the
-anti-snipe period ends, no donation is attempted.
+Launch liquidity ranges must support intended early trading. Once the anti-snipe
+period ends, no donation is attempted and the drained-range fallback is moot.
+
+The treasury fee leaves the PoolManager as an ERC-20 transfer inside `afterSwap`,
+before a buyer settles their IMD input. It is therefore paid from IMD the
+PoolManager already holds: this pool's IMD seed plus every other IMD balance in
+the singleton. The factory must seed IMD alongside the tokens (the brief's 80%
+pool allocation is paired with IMD); a token-only seed on a PoolManager holding
+no IMD could not process a buy until some IMD arrived. On mainnet the singleton
+already holds far more IMD than any realistic single-swap treasury fee.
 
 The fixed IMD token is assumed to support ordinary ERC-20 transfer accounting
 (no transfer tax or rebasing). Treasury transfer failure reverts the swap.
 No live-chain bytecode verification or transaction broadcasting is performed by
 the test suite. The deployer must confirm the named mainnet contracts and token
-behavior before funding. Donations can be captured by eligible in-range LPs,
-including just-in-time liquidity; the anti-snipe schedule is a fee policy, not
-a guarantee against MEV or trading through other pools.
+behavior before funding. The anti-snipe schedule is a fee policy, not a guarantee
+against MEV or trading through other pools.
 
 The included deterministic and fuzz tests cover successful fees and settlement,
-failure rollback, access restrictions, and plain token behavior. Bytecode size
-and forbidden runtime opcodes are also checked. Local testing and code review
+failure rollback, access restrictions, the liquidity gate (third-party and
+just-in-time additions rejected during the window, factory and launch-transaction
+seeding accepted, open provision afterwards), the drained-range fallback,
+CREATE2-helper deployment, and plain token behavior. Bytecode size and forbidden
+runtime opcodes are also checked. Local testing and code review
 do not replace the launch network's independent security review before release.
