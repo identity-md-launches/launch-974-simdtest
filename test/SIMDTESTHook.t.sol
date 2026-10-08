@@ -17,6 +17,15 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Vm, TestPairedToken, LiquidityActor, Create2Helper, AtomicLauncher} from "./helpers/TestSupport.sol";
 
+/// @dev Syncs a currency and triggers the treasury payout within the same call, so the hook sees
+///      the synced state (Foundry resets transient storage between top-level test calls).
+contract SyncedCaller {
+    function syncThenPay(IPoolManager manager, SIMDTESTHook hook, Currency currency) external returns (uint256) {
+        manager.sync(currency);
+        return hook.payTreasury();
+    }
+}
+
 contract SIMDTESTHookTest is IUnlockCallback {
     using BalanceDeltaLibrary for BalanceDelta;
     using PoolIdLibrary for PoolKey;
@@ -159,6 +168,21 @@ contract SIMDTESTHookTest is IUnlockCallback {
         BalanceDelta delta;
         if (action == 0) {
             delta = manager.swap(key, abi.decode(payload, (IPoolManager.SwapParams)), "");
+        } else if (action == 2) {
+            // Pre-paying router: IMD is synced and transferred before the swap and settled after it.
+            IPoolManager.SwapParams memory params = abi.decode(payload, (IPoolManager.SwapParams));
+            Currency pairCurrency = Currency.wrap(PAIR);
+            uint256 input = uint256(-params.amountSpecified);
+            manager.sync(pairCurrency);
+            require(pair.transfer(address(manager), input));
+            delta = manager.swap(key, params, "");
+            require(manager.settle() == input, "prepaid amount");
+            Currency tokenCurrency = Currency.wrap(address(token));
+            manager.take(tokenCurrency, address(this), uint256(uint128(_pairIs0() ? delta.amount1() : delta.amount0())));
+            require(manager.currencyDelta(address(hook), pairCurrency) == 0, "hook paired debt");
+            return abi.encode(delta);
+        } else if (action == 3) {
+            (delta,) = manager.modifyLiquidity(key, abi.decode(payload, (IPoolManager.ModifyLiquidityParams)), "");
         } else {
             (delta,) = manager.modifyLiquidity(
                 key,
@@ -240,6 +264,7 @@ contract SIMDTESTHookTest is IUnlockCallback {
             "paired conservation"
         );
         require(pair.balanceOf(address(hook)) == 0 && token.balanceOf(address(hook)) == 0, "retained hook funds");
+        require(hook.pendingTreasury() == 0, "treasury fee deferred although the manager held IMD");
         require(pair.totalSupply() == beforeTrade.supply && pair.balanceOf(address(0xdead)) == 0, "paired burn");
         require(manager.getLiquidity(key.toId()) == LIQUIDITY, "donation changed liquidity units");
         if (buy) {
@@ -354,6 +379,126 @@ contract SIMDTESTHookTest is IUnlockCallback {
         require(pair.balanceOf(address(this)) == beforeUser && pair.balanceOf(TREASURY) == 0, "balances changed");
         (uint160 price,,,) = manager.getSlot0(key.toId());
         require(price == INITIAL_PRICE, "price changed on failure");
+    }
+
+    /// @dev Empties the pool's IMD and collects the seed position's fees so that the PoolManager
+    ///      physically holds only rounding dust of IMD. Returns that dust.
+    function _starveManagerOfPaired() private returns (uint256 held) {
+        vm.roll(hook.openingBlock() + 10);
+        _swap(_params(false, true, 1e24));
+        require(manager.getLiquidity(key.toId()) == 0, "range not drained");
+        manager.unlock(abi.encode(uint8(1), abi.encode(int256(0))));
+        held = pair.balanceOf(address(manager));
+        require(held < 1000, "manager still holds IMD");
+    }
+
+    function testBuySucceedsWhenManagerHoldsLessImdThanTreasuryFee() public {
+        uint256 held = _starveManagerOfPaired();
+        uint256 amount = (held + 1) * 10000 / 50 + 10000;
+        uint256 fee = amount * 50 / 10000;
+        uint256 treasuryBefore = pair.balanceOf(TREASURY);
+        vm.recordLogs();
+        BalanceDelta delta = _swap(_params(true, true, amount));
+        Observations memory seen = _observations(vm.getRecordedLogs());
+        require((_pairIs0() ? delta.amount0() : delta.amount1()) == -int256(amount), "buy did not execute");
+        require(seen.treasury == fee && seen.anti == 0, "fee accounting");
+        // The IMD only reaches the manager when the buyer settles after the hook's last callback,
+        // so the treasury fee is held as a claim of the hook instead of failing the swap.
+        require(pair.balanceOf(TREASURY) == treasuryBefore, "treasury paid from IMD the manager did not hold");
+        require(hook.pendingTreasury() == fee, "fee not deferred as a claim");
+        require(pair.balanceOf(address(manager)) == held + amount, "buyer settlement");
+        // Now the manager holds the buyer's IMD: anyone can pay the treasury out.
+        vm.prank(address(0xBEEF));
+        uint256 paid = hook.payTreasury();
+        require(paid == fee && hook.pendingTreasury() == 0, "claims not redeemed");
+        require(pair.balanceOf(TREASURY) - treasuryBefore == fee, "treasury not paid by payTreasury");
+        require(pair.balanceOf(address(manager)) == held + amount - fee, "manager balance after payout");
+        require(hook.payTreasury() == 0, "nothing left to pay");
+    }
+
+    function testDeferredTreasuryClaimsArePaidByLaterSwap() public {
+        uint256 held = _starveManagerOfPaired();
+        uint256 treasuryBefore = pair.balanceOf(TREASURY);
+        uint256 first = (held + 1) * 10000 / 50 + 10000;
+        _swap(_params(true, true, first));
+        uint256 deferred = hook.pendingTreasury();
+        require(deferred == first * 50 / 10000 && deferred != 0, "first fee deferred");
+        // A second buy whose fee exceeds the manager's IMD defers again and accumulates.
+        _swap(_params(true, true, 100e18));
+        require(hook.pendingTreasury() == deferred + 100e18 * 50 / 10000, "second fee not accumulated");
+        require(pair.balanceOf(TREASURY) == treasuryBefore, "treasury paid early");
+        deferred = hook.pendingTreasury();
+        // The buyer's 100 IMD now sits in the manager: the next swap pays its own fee and the backlog.
+        vm.recordLogs();
+        _swap(_params(true, true, 100e18));
+        Observations memory seen = _observations(vm.getRecordedLogs());
+        require(seen.treasury == 100e18 * 50 / 10000, "third fee accounting");
+        require(hook.pendingTreasury() == 0, "backlog not flushed");
+        require(pair.balanceOf(TREASURY) - treasuryBefore == deferred + seen.treasury, "treasury short");
+        require(pair.balanceOf(address(hook)) == 0, "retained hook funds");
+    }
+
+    function testTokenOnlySeedOnManagerWithoutImdCanBeBought() public {
+        // Fresh singleton holding no IMD at all; the factory seeds SIMDTEST only, above the price.
+        manager = IPoolManager(
+            _create(abi.encodePacked(vm.getCode("PoolManager.sol:PoolManager"), abi.encode(address(this))))
+        );
+        hook = _deployHook();
+        key = _poolKey(hook);
+        manager.initialize(key, INITIAL_PRICE);
+        IPoolManager.ModifyLiquidityParams memory seed =
+            _pairIs0() ? _liquidityParams(-6000, -60, 1e24, 0) : _liquidityParams(60, 6000, 1e24, 0);
+        manager.unlock(abi.encode(uint8(3), abi.encode(seed)));
+        require(pair.balanceOf(address(manager)) == 0, "manager holds IMD");
+        for (uint256 round; round < 2; ++round) {
+            // Once inside the anti-snipe window (donation to the seed) and once after it.
+            if (round == 1) vm.roll(hook.openingBlock() + 10);
+            uint256 treasuryBefore = pair.balanceOf(TREASURY);
+            uint256 pendingBefore = hook.pendingTreasury();
+            vm.recordLogs();
+            BalanceDelta delta = _swap(_params(true, true, 1000e18));
+            Observations memory seen = _observations(vm.getRecordedLogs());
+            require((_pairIs0() ? delta.amount0() : delta.amount1()) == -1000e18, "buy did not execute");
+            require(seen.treasury == 5e18 && seen.donated == seen.anti, "fee accounting");
+            if (round == 0) {
+                // The first buy's IMD was not in the manager yet: deferred.
+                require(hook.pendingTreasury() == pendingBefore + 5e18, "fee not deferred");
+                require(pair.balanceOf(TREASURY) == treasuryBefore, "paid from IMD the manager lacked");
+            } else {
+                // The manager now holds the first buyer's IMD: this fee and the backlog are paid.
+                require(hook.pendingTreasury() == 0, "backlog not flushed");
+                require(pair.balanceOf(TREASURY) - treasuryBefore == pendingBefore + 5e18, "treasury short");
+            }
+        }
+        require(pair.balanceOf(address(hook)) == 0, "retained hook funds");
+    }
+
+    function testPrepayingRouterDefersTreasuryFeeInsteadOfBreakingSettlement() public {
+        // The router synced IMD before the swap. A take inside afterSwap would be subtracted from
+        // the router's settle, so the hook keeps the fee as a claim until IMD is free to leave.
+        uint256 treasuryBefore = pair.balanceOf(TREASURY);
+        uint256 beforeTokens = token.balanceOf(address(this));
+        BalanceDelta delta =
+            abi.decode(manager.unlock(abi.encode(uint8(2), abi.encode(_params(true, true, 100e18)))), (BalanceDelta));
+        int128 tokenDelta = _pairIs0() ? delta.amount1() : delta.amount0();
+        require(tokenDelta > 0 && token.balanceOf(address(this)) - beforeTokens == uint128(tokenDelta), "buy output");
+        require(hook.pendingTreasury() == 100e18 * 50 / 10000, "fee not deferred");
+        require(pair.balanceOf(TREASURY) == treasuryBefore, "take during synced settlement");
+        require(hook.payTreasury() == 100e18 * 50 / 10000, "payout");
+        require(pair.balanceOf(TREASURY) - treasuryBefore == 100e18 * 50 / 10000, "treasury short");
+    }
+
+    function testPayTreasuryIsNoopWhileImdIsSyncedOrNothingPending() public {
+        require(hook.payTreasury() == 0 && pair.balanceOf(TREASURY) == 0, "paid without claims");
+        uint256 held = _starveManagerOfPaired();
+        _swap(_params(true, true, (held + 1) * 10000 / 50 + 10000));
+        uint256 pending = hook.pendingTreasury();
+        require(pending != 0, "nothing deferred");
+        // Transient state only survives within one call, so sync and pay from one helper call.
+        SyncedCaller caller = new SyncedCaller();
+        require(caller.syncThenPay(manager, hook, Currency.wrap(PAIR)) == 0, "paid during synced IMD");
+        require(hook.pendingTreasury() == pending, "claims changed during synced IMD");
+        require(hook.payTreasury() == pending && hook.pendingTreasury() == 0, "payout once IMD is free");
     }
 
     function testDrainedRangeRoutesAntiSnipeToTreasury() public {
@@ -493,6 +638,8 @@ contract SIMDTESTHookTest is IUnlockCallback {
         hook.afterSwap(address(this), key, _params(true, true, 100e18), BalanceDelta.wrap(0), "");
         vm.expectRevert(SIMDTESTHook.NotPoolManager.selector);
         hook.beforeAddLiquidity(address(this), key, _liquidityParams(-60, 60, 1, 0), "");
+        vm.expectRevert(SIMDTESTHook.NotPoolManager.selector);
+        hook.unlockCallback("");
     }
 
     function testInitializationOnlyFactoryAndOnlyOnce() public {

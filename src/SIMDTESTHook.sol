@@ -3,8 +3,11 @@ pragma solidity 0.8.26;
 
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {IERC20Minimal} from "@uniswap/v4-core/src/interfaces/external/IERC20Minimal.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -15,9 +18,13 @@ import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/Bef
 /// @dev Initialization only binds the opening block. Fee mechanics run exclusively in swap callbacks.
 ///      While the anti-snipe fee is nonzero, only the launch factory (or the launch transaction
 ///      itself) may add liquidity, so donated anti-snipe fees reach the seeded launch liquidity
-///      rather than just-in-time positions.
-contract SIMDTESTHook {
+///      rather than just-in-time positions. The treasury fee leaves the PoolManager as an ERC-20
+///      transfer whenever the manager physically holds enough IMD at that moment; otherwise it is
+///      held as an ERC-6909 claim owned by this hook and paid out by the next swap or by anyone
+///      through `payTreasury`, so a swap never fails for lack of IMD in the singleton.
+contract SIMDTESTHook is IUnlockCallback {
     using StateLibrary for IPoolManager;
+    using TransientStateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
     address public constant PAIRED_CURRENCY = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
@@ -53,6 +60,12 @@ contract SIMDTESTHook {
 
     event PoolOpened(uint256 indexed blockNumber);
     event SwapFees(uint256 grossPairedAmount, uint256 antiSnipeAmount, uint256 treasuryAmount);
+    /// @notice IMD transferred out of the PoolManager to the treasury (this swap's fee plus any
+    ///         previously deferred claims).
+    event TreasuryPaid(uint256 amount);
+    /// @notice IMD owed to the treasury that stayed in the PoolManager as a claim of this hook
+    ///         because the manager could not pay it out at that moment.
+    event TreasuryDeferred(uint256 amount);
 
     constructor(IPoolManager manager, address token, address factory) {
         if (
@@ -162,11 +175,65 @@ contract SIMDTESTHook {
             poolManager.donate(key, pairIs0 ? donation : 0, pairIs0 ? 0 : donation, "");
         }
         if (treasuryFee != 0) {
-            poolManager.take(Currency.wrap(PAIRED_CURRENCY), TREASURY, treasuryFee);
+            _payTreasury(treasuryFee);
         }
-        // donate/take debit this hook. The returned fee delta credits it during manager accounting.
+        // donate/take/mint debit this hook. The returned fee delta credits it during manager accounting.
         emit SwapFees(gross, donation, treasuryFee);
         return (IHooks.afterSwap.selector, specified ? int128(0) : int128(uint128(fee)));
+    }
+
+    /// @notice Treasury IMD held inside the PoolManager as this hook's ERC-6909 claim, waiting for
+    ///         the manager to hold enough IMD to pay it out. Anyone can trigger payment with
+    ///         `payTreasury`; every swap also pays it out when possible.
+    function pendingTreasury() public view returns (uint256) {
+        return poolManager.balanceOf(address(this), Currency.wrap(PAIRED_CURRENCY).toId());
+    }
+
+    /// @notice Permissionless: redeems deferred treasury claims for IMD and transfers them to the
+    ///         treasury, as far as the PoolManager's IMD balance allows.
+    function payTreasury() external returns (uint256 paid) {
+        paid = abi.decode(poolManager.unlock(""), (uint256));
+    }
+
+    /// @dev Only reached through `payTreasury`: the manager calls back the account that unlocked it.
+    function unlockCallback(bytes calldata) external onlyPoolManager returns (bytes memory) {
+        uint256 claims = pendingTreasury();
+        uint256 available = _availablePaired();
+        uint256 paid = claims < available ? claims : available;
+        if (paid != 0) {
+            poolManager.burn(address(this), Currency.wrap(PAIRED_CURRENCY).toId(), paid);
+            poolManager.take(Currency.wrap(PAIRED_CURRENCY), TREASURY, paid);
+            emit TreasuryPaid(paid);
+        }
+        return abi.encode(paid);
+    }
+
+    /// @dev `amount` is this swap's treasury fee, credited to the hook by the returned fee delta.
+    ///      Pays it, and any earlier deferred claims, with a real transfer when the manager holds the
+    ///      IMD; otherwise keeps it as a claim so the swap itself never fails.
+    function _payTreasury(uint256 amount) private {
+        Currency pair = Currency.wrap(PAIRED_CURRENCY);
+        uint256 available = _availablePaired();
+        uint256 owed = amount;
+        uint256 claims = pendingTreasury();
+        if (claims != 0 && available >= amount + claims) {
+            poolManager.burn(address(this), pair.toId(), claims);
+            owed += claims;
+        }
+        if (available >= owed) {
+            poolManager.take(pair, TREASURY, owed);
+            emit TreasuryPaid(owed);
+        } else {
+            poolManager.mint(address(this), pair.toId(), amount);
+            emit TreasuryDeferred(amount);
+        }
+    }
+
+    /// @dev IMD the manager can transfer out right now. Zero while a caller has synced IMD and not
+    ///      yet settled: a transfer then would be subtracted from that caller's payment.
+    function _availablePaired() private view returns (uint256) {
+        if (Currency.unwrap(poolManager.getSyncedCurrency()) == PAIRED_CURRENCY) return 0;
+        return IERC20Minimal(PAIRED_CURRENCY).balanceOf(address(poolManager));
     }
 
     function _swapFees(PoolKey calldata key, IPoolManager.SwapParams calldata params, BalanceDelta delta)

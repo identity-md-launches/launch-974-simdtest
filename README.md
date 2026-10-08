@@ -149,11 +149,40 @@ the LP fee is charged on the swap input, percentages are not a simple additive
 effective price quote. Slippage and price impact also apply.
 
 Every completed swap immediately calls `PoolManager.donate` with its anti-snipe
-IMD amount (when nonzero) and `PoolManager.take` to send its treasury IMD fee
-directly to the fixed treasury. Donation and take create hook debts that the
-positive returned fee delta settles within the same unlock. No fee remains in
-the hook, is converted to ETH, is deferred as a claim, or is sent to a burn
+IMD amount (when nonzero) and pays its treasury IMD fee as described under
+"Treasury payment" below. Donation, take and claim minting create hook debts
+that the positive returned fee delta settles within the same unlock. No fee is
+held as an ERC-20 balance of the hook, converted to ETH, or sent to a burn
 address. SIMDTEST transfers and approvals never call the hook.
+
+### Treasury payment
+
+`PoolManager.take` is a real ERC-20 transfer out of the singleton, executed in
+`afterSwap` before a buyer has settled their IMD input. It can only move IMD the
+PoolManager already holds (this pool's reserve, uncollected fees, other pools).
+If the hook always called `take`, a buy would revert whenever the manager held
+less IMD than 0.5% of that buy: for example after sellers have emptied the
+pool's IMD and the launch position has collected its fees. The hook therefore
+pays the treasury in two ways:
+
+1. **Direct transfer** (the normal case). If the manager's IMD balance covers
+   the fee and nobody has `sync`ed IMD without settling yet, `afterSwap` calls
+   `take(IMD, treasury, fee)` and emits `TreasuryPaid`. Any previously deferred
+   claims are redeemed and paid in the same call when the balance covers them.
+2. **Deferred claim** (starved manager, or a pre-paying router that synced IMD
+   before the swap). The hook mints itself an ERC-6909 claim for the fee inside
+   the manager and emits `TreasuryDeferred`. The claim is backed as soon as the
+   buyer settles. `pendingTreasury()` shows the outstanding amount. It is paid
+   out, as far as the manager's IMD balance allows, by the next swap in this
+   pool or by anyone calling `payTreasury()`; that function is permissionless,
+   takes no arguments and can only move IMD to the fixed treasury.
+
+Within one unlock the treasury's ERC-20 balance can therefore lag the swap that
+earned the fee; the fee itself is still charged on every swap and can never go
+anywhere but the treasury. The `SwapFees` event always reports the charged
+amount. Operationally the treasury should call `payTreasury()` (or wait for the
+next swap) if `pendingTreasury()` is nonzero after a period of thin IMD
+reserves; no key or privilege is involved.
 
 Donation distributes IMD fee growth to liquidity in range **after the swap**, as
 the brief's `PoolManager.donate` requirement implies. It increases the fees the
@@ -183,16 +212,16 @@ check realized amounts and use appropriate user slippage limits/deadlines.
 Launch liquidity ranges must support intended early trading. Once the anti-snipe
 period ends, no donation is attempted and the drained-range fallback is moot.
 
-The treasury fee leaves the PoolManager as an ERC-20 transfer inside `afterSwap`,
-before a buyer settles their IMD input. It is therefore paid from IMD the
-PoolManager already holds: this pool's IMD seed plus every other IMD balance in
-the singleton. The factory must seed IMD alongside the tokens (the brief's 80%
-pool allocation is paired with IMD); a token-only seed on a PoolManager holding
-no IMD could not process a buy until some IMD arrived. On mainnet the singleton
-already holds far more IMD than any realistic single-swap treasury fee.
+A buy never depends on IMD already being in the PoolManager: when the manager
+cannot pay the treasury fee at that moment the fee is deferred as a claim (see
+"Treasury payment"). The factory should still seed IMD alongside the tokens
+(the brief's 80% pool allocation is paired with IMD) so the pool has two-sided
+liquidity; on mainnet the singleton also holds other pools' IMD, so deferral is
+expected to be rare.
 
 The fixed IMD token is assumed to support ordinary ERC-20 transfer accounting
-(no transfer tax or rebasing). Treasury transfer failure reverts the swap.
+(no transfer tax or rebasing). If the treasury address rejects an IMD transfer
+the swap that attempted the direct transfer reverts.
 No live-chain bytecode verification or transaction broadcasting is performed by
 the test suite. The deployer must confirm the named mainnet contracts and token
 behavior before funding. The anti-snipe schedule is a fee policy, not a guarantee
@@ -202,6 +231,8 @@ The included deterministic and fuzz tests cover successful fees and settlement,
 failure rollback, access restrictions, the liquidity gate (third-party and
 just-in-time additions rejected during the window, factory and launch-transaction
 seeding accepted, open provision afterwards), the drained-range fallback,
-CREATE2-helper deployment, and plain token behavior. Bytecode size and forbidden
+treasury payment when the manager holds less IMD than the fee (deferred claim,
+`payTreasury`, automatic payout by a later swap, pre-paying router), CREATE2-helper
+deployment, and plain token behavior. Bytecode size and forbidden
 runtime opcodes are also checked. Local testing and code review
 do not replace the launch network's independent security review before release.

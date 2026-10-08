@@ -128,6 +128,7 @@ contract SIMDTESTSecurityTest {
         _requiresManager(abi.encodeCall(hook.beforeAddLiquidity, (address(this), key, liquidity, bytes(""))));
         _requiresManager(abi.encodeCall(hook.beforeSwap, (address(this), key, params, bytes(""))));
         _requiresManager(abi.encodeCall(hook.afterSwap, (address(this), key, params, BalanceDelta.wrap(0), bytes(""))));
+        _requiresManager(abi.encodeCall(hook.unlockCallback, (bytes(""))));
         require(!hook.initialized(), "unauthorized initialization had no effect");
     }
 
