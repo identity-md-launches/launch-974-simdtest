@@ -1,15 +1,22 @@
 {
   "kind": "univ4_hook",
+  "hook": {
+    "contract": "SIMDTESTHook",
+    "constructorArgs": ["$poolManager", "$token", "$factory"],
+    "permissions": [
+      "beforeInitialize",
+      "beforeAddLiquidity",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
   "token": {
     "contract": "SIMDTEST",
     "name": "SIMDTEST",
     "symbol": "SIMDTEST",
     "decimals": 18
-  },
-  "hook": {
-    "contract": "SIMDTESTHook",
-    "permissions": ["beforeInitialize", "beforeAddLiquidity", "beforeSwap", "afterSwap", "beforeSwapReturnDelta", "afterSwapReturnDelta"],
-    "constructorArgs": ["$poolManager", "$token", "$factory"]
   },
   "pool": {
     "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
@@ -17,5 +24,5 @@
     "tickSpacing": 60,
     "initialPrice": "79228162514264337593543950336"
   },
-  "notes": "Ethereum mainnet SIMD Launchpad preset. Resolve $poolManager to 0x000000000004444c5dc75cB358380D2e3dE08A90, $token to the freshly deployed SIMDTEST and $factory to the launch factory that calls PoolManager.initialize directly (beforeInitialize accepts only that sender, once). Mine hook flags 0x28cc. The factory must initialize, seed the 80% pool allocation with IMD, and perform the 10% dead-address / 10% swarm allocation; seeding must happen either directly from the factory address or inside the initialize transaction, because beforeAddLiquidity rejects every other liquidity addition while the anti-snipe fee is nonzero (blocks B..B+9) so just-in-time positions cannot capture donations. The factory derives the actual opening price from launch economics. Hook fees stay in IMD: 0.5% to 0x3dd5f73dd1a4e62630fad3909673f130ad429985 plus a 30%-to-0% ten-block anti-snipe amount donated via PoolManager.donate, which accrues as claimable fee growth to the in-range launch position (its owner must be able to collect); if a swap leaves no in-range liquidity the anti-snipe amount goes to the treasury instead. The treasury fee is transferred out of the PoolManager inside the swap when the manager holds enough IMD; otherwise it is kept as an ERC-6909 claim of the hook (pendingTreasury()) and paid to the treasury by the next swap or by anyone calling the permissionless payTreasury(), so buys never fail for lack of IMD in the singleton. The launchpad handles the 1% creator fee externally; this hook never duplicates it."
+  "notes": "SIMD Launchpad preset test launch on Ethereum mainnet (chainId 1). Token: SIMDTEST, a plain fixed-supply ERC-20 (1,000,000,000 units, 18 decimals, no constructor arguments) that mints the whole supply to its deployer and has no owner, mint, burn, pause, tax or transfer restriction. Hook: SIMDTESTHook, constructor (IPoolManager manager, address token, address factory) -> $poolManager (0x000000000004444c5dc75cB358380D2e3dE08A90 on mainnet), $token (the SIMDTEST deployed just before it) and $factory (the launch factory). The hook has no owner, setters, selfdestruct, delegatecall or upgrade path; every address is immutable or a compile-time constant. Pool: SIMDTEST/IMD (IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7), static LP fee 12500 (1.25%), tickSpacing 60; the hook's beforeInitialize accepts only this exact key with this fee and spacing, only when called by the PoolManager with $factory as the initializing sender, and only once. It records the opening block; the required address flags are 0x28cc (beforeInitialize, beforeAddLiquidity, beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta). initialPrice is provenance only; the factory sets the opening sqrtPriceX96 from the launch economics. Fee mechanics run in swap callbacks and are denominated in IMD, on top of the 1.25% LP fee: (1) anti-snipe fee for the first 10 blocks after initialization, 30% in the opening block declining linearly by 3 percentage points per block to 0% from block +10, donated to the pool's in-range liquidity via PoolManager.donate inside the same swap (if the swap leaves no in-range liquidity, that amount goes to the treasury instead so the swap does not fail); (2) fixed 0.5% treasury fee on every swap to 0x3dd5f73dd1a4e62630fad3909673f130ad429985, transferred out of the PoolManager during the swap when the manager holds enough IMD, otherwise held as the hook's ERC-6909 claim (pendingTreasury()) and paid by the next swap or by anyone calling the permissionless payTreasury(). Fees are taken via beforeSwap/afterSwap return deltas; the hook never overrides the LP fee. Partial fills of a specified IMD amount revert atomically rather than charging a fee on unexecuted input. beforeAddLiquidity: while the anti-snipe fee is nonzero (blocks +0 to +9) only $factory, or any caller inside the initializing transaction, may add liquidity, so donations reach the seeded launch position rather than just-in-time positions; removals are never restricted and provision is open to everyone afterwards. The seeded liquidity should therefore be added by $factory or within the initialize transaction. Donated anti-snipe fees accrue as fee growth to the in-range launch position; its owner collects them normally. No paired token is ever burned. Supply allocation (burn, pool seed, swarm) and the 1% creator fee are handled by the launch policy and fee splitter outside this hook. Tests (test/) deploy the real v4 PoolManager locally and cover the decay schedule, donation accounting, treasury payment and deferral, liquidity lock, plain transfers and the absence of privileged functions."
 }
