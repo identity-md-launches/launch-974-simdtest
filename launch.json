@@ -1,0 +1,21 @@
+{
+  "kind": "univ4_hook",
+  "token": {
+    "contract": "SIMDTEST",
+    "name": "SIMDTEST",
+    "symbol": "SIMDTEST",
+    "decimals": 18
+  },
+  "hook": {
+    "contract": "SIMDTESTHook",
+    "permissions": ["beforeInitialize", "beforeSwap", "afterSwap", "beforeSwapReturnDelta", "afterSwapReturnDelta"],
+    "constructorArgs": ["$poolManager", "$token"]
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Ethereum mainnet SIMD Launchpad preset. Resolve $poolManager to 0x000000000004444c5dc75cB358380D2e3dE08A90 and $token to the freshly deployed SIMDTEST. The deploying factory must initialize atomically and perform the 10% dead-address / 80% pool / 10% swarm allocation. Mine hook flags 0x20cc. The factory derives the actual opening price from launch economics. Hook fees stay in IMD: 0.5% to 0x3dd5f73dd1a4e62630fad3909673f130ad429985 plus a 30%-to-0% ten-block anti-snipe donation to in-range LPs. The launchpad handles the 1% creator fee externally; this hook never duplicates it."
+}
